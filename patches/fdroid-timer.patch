@@ -1,0 +1,1288 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 05a47e1..c08e70a 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -56,7 +56,7 @@ android {
+     }
+     create("full") {
+       dimension = "variant"
+-      applicationIdSuffix = ".fdroid"
++      applicationIdSuffix = ".fdroid.timer"
+     }
+     create("default") { dimension = "release" }
+     create("nightly") {
+@@ -96,6 +96,15 @@ androidComponents {
+       variantBuilder.enable = false
+     }
+   }
++  // optional version overrides for patched builds, e.g. -PpatchVersionCode=2000053001
++  val patchVersionCode = providers.gradleProperty("patchVersionCode").orNull?.toInt()
++  val patchVersionName = providers.gradleProperty("patchVersionName").orNull
++  onVariants { variant ->
++    variant.outputs.forEach { output ->
++      if (patchVersionCode != null) output.versionCode.set(patchVersionCode)
++      if (patchVersionName != null) output.versionName.set(patchVersionName)
++    }
++  }
+ }
+ 
+ dependencies {
+diff --git a/app/src/androidTest/java/org/fdroid/repo/RepoUpdateWorkerTest.kt b/app/src/androidTest/java/org/fdroid/repo/RepoUpdateWorkerTest.kt
+index 08b99e0..83b9a7b 100644
+--- a/app/src/androidTest/java/org/fdroid/repo/RepoUpdateWorkerTest.kt
++++ b/app/src/androidTest/java/org/fdroid/repo/RepoUpdateWorkerTest.kt
+@@ -81,6 +81,20 @@ internal class RepoUpdateWorkerTest {
+     assertEquals(WorkInfo.State.ENQUEUED, infos.first().state)
+   }
+ 
++  @Test
++  fun schedulesWorkWithCustomInterval() {
++    RepoUpdateWorker.scheduleOrCancel(context, AutoUpdateValues.Always, intervalMinutes = 90)
++
++    val info =
++      WorkManager.getInstance(context)
++        .getWorkInfosForUniqueWork(UNIQUE_WORK_NAME_REPO_AUTO_UPDATE)
++        .get(5, TimeUnit.SECONDS)
++        .single()
++
++    assertEquals(TimeUnit.MINUTES.toMillis(90), info.periodicityInfo?.repeatIntervalMillis)
++    assertEquals(TimeUnit.MINUTES.toMillis(15), info.periodicityInfo?.flexIntervalMillis)
++  }
++
+   @Test
+   fun cancelsWorkForNeverSetting() {
+     RepoUpdateWorker.scheduleOrCancel(context, AutoUpdateValues.Always)
+diff --git a/app/src/androidTest/java/org/fdroid/updates/AppUpdateWorkerTest.kt b/app/src/androidTest/java/org/fdroid/updates/AppUpdateWorkerTest.kt
+index a6e8756..2f7dae1 100644
+--- a/app/src/androidTest/java/org/fdroid/updates/AppUpdateWorkerTest.kt
++++ b/app/src/androidTest/java/org/fdroid/updates/AppUpdateWorkerTest.kt
+@@ -22,7 +22,9 @@ import io.mockk.runs
+ import io.mockk.verify
+ import java.util.concurrent.TimeUnit
+ import kotlin.test.assertEquals
++import kotlin.test.assertFalse
+ import kotlin.test.assertIs
++import kotlin.test.assertTrue
+ import kotlinx.coroutines.test.runTest
+ import org.fdroid.NotificationManager
+ import org.fdroid.NotificationManager.Companion.NOTIFICATION_ID_APP_INSTALLS
+@@ -79,6 +81,42 @@ internal class AppUpdateWorkerTest {
+     assertEquals(WorkInfo.State.ENQUEUED, infos.first().state)
+   }
+ 
++  @Test
++  fun schedulesWorkWithCustomIntervalAndConstraints() {
++    AppUpdateWorker.scheduleOrCancel(
++      context = context,
++      autoUpdate = AutoUpdateValues.Always,
++      intervalMinutes = 30,
++      requiresCharging = true,
++      requiresIdle = false,
++    )
++
++    val info =
++      WorkManager.getInstance(context)
++        .getWorkInfosForUniqueWork(UNIQUE_WORK_NAME_APP_UPDATE)
++        .get(5, TimeUnit.SECONDS)
++        .single()
++
++    assertEquals(TimeUnit.MINUTES.toMillis(30), info.periodicityInfo?.repeatIntervalMillis)
++    assertEquals(TimeUnit.MINUTES.toMillis(30), info.periodicityInfo?.flexIntervalMillis)
++    assertTrue(info.constraints.requiresCharging())
++    assertFalse(info.constraints.requiresDeviceIdle())
++  }
++
++  @Test
++  fun cancelsWorkForImmediatelySetting() {
++    AppUpdateWorker.scheduleOrCancel(context, AutoUpdateValues.Always)
++    AppUpdateWorker.scheduleOrCancel(context, AutoUpdateValues.Immediately)
++
++    val infos =
++      WorkManager.getInstance(context)
++        .getWorkInfosForUniqueWork(UNIQUE_WORK_NAME_APP_UPDATE)
++        .get(5, TimeUnit.SECONDS)
++
++    assertEquals(1, infos.size)
++    assertEquals(WorkInfo.State.CANCELLED, infos.first().state)
++  }
++
+   @Test
+   fun cancelsWorkForNeverSetting() {
+     AppUpdateWorker.scheduleOrCancel(context, AutoUpdateValues.Always)
+diff --git a/app/src/main/kotlin/org/fdroid/App.kt b/app/src/main/kotlin/org/fdroid/App.kt
+index 4828e34..846e89a 100644
+--- a/app/src/main/kotlin/org/fdroid/App.kt
++++ b/app/src/main/kotlin/org/fdroid/App.kt
+@@ -104,8 +104,18 @@ class App : Application(), Configuration.Provider, SingletonImageLoader.Factory
+     // don't show self-update notification unless we enable it first
+     SelfUpdateReceiver.disable(this)
+ 
+-    RepoUpdateWorker.scheduleOrCancel(applicationContext, settingsManager.repoUpdates)
+-    AppUpdateWorker.scheduleOrCancel(applicationContext, settingsManager.autoUpdateApps)
++    RepoUpdateWorker.scheduleOrCancel(
++      context = applicationContext,
++      autoUpdate = settingsManager.repoUpdates,
++      intervalMinutes = settingsManager.repoUpdateIntervalMinutes,
++    )
++    AppUpdateWorker.scheduleOrCancel(
++      context = applicationContext,
++      autoUpdate = settingsManager.autoUpdateApps,
++      intervalMinutes = settingsManager.appUpdateIntervalMinutes,
++      requiresCharging = settingsManager.appUpdateRequiresCharging,
++      requiresIdle = settingsManager.appUpdateRequiresIdle,
++    )
+   }
+ 
+   private fun isAcraProcess(): Boolean {
+diff --git a/app/src/main/kotlin/org/fdroid/repo/RepoUpdateManager.kt b/app/src/main/kotlin/org/fdroid/repo/RepoUpdateManager.kt
+index e8219da..9548770 100644
+--- a/app/src/main/kotlin/org/fdroid/repo/RepoUpdateManager.kt
++++ b/app/src/main/kotlin/org/fdroid/repo/RepoUpdateManager.kt
+@@ -113,6 +113,7 @@ internal constructor(
+     if (shouldSkipUpdate()) return
+ 
+     _isUpdating.value = true
++    var installUpdates = false
+     try {
+       currentCoroutineContext().ensureActive()
+       var anyReposProcessed = false
+@@ -133,12 +134,14 @@ internal constructor(
+       updateLastCheckTimestamp(anyReposProcessed)
+ 
+       if (anyReposProcessed) {
+-        checkAndNotifyAppUpdates()
++        installUpdates = checkAndNotifyAppUpdates()
+       }
+     } finally {
+       notificationManager.cancelUpdateRepoNotification()
+       _isUpdating.value = false
+     }
++    // install updates right away (after repo update finished) if the user wants that
++    if (installUpdates) updatesManager.updateAll(canAskPreApprovalNow = false)
+   }
+ 
+   /**
+@@ -212,12 +215,17 @@ internal constructor(
+     }
+   }
+ 
+-  private suspend fun checkAndNotifyAppUpdates() {
++  /** @return true if available app updates should get installed right away. */
++  private suspend fun checkAndNotifyAppUpdates(): Boolean {
+     updatesManager.loadUpdates().join() // wait here until we have finished loading updates
+     val numUpdates = updatesManager.numUpdates.value
+     if (numUpdates > 0) {
++      if (settingsManager.autoUpdateApps == SettingsConstants.AutoUpdateValues.Immediately) {
++        return true
++      }
+       val states = updatesManager.notificationStates
+       notificationManager.showAppUpdatesAvailableNotification(states)
+     }
++    return false
+   }
+ }
+diff --git a/app/src/main/kotlin/org/fdroid/repo/RepoUpdateWorker.kt b/app/src/main/kotlin/org/fdroid/repo/RepoUpdateWorker.kt
+index b56f1c7..51df0c5 100644
+--- a/app/src/main/kotlin/org/fdroid/repo/RepoUpdateWorker.kt
++++ b/app/src/main/kotlin/org/fdroid/repo/RepoUpdateWorker.kt
+@@ -21,8 +21,7 @@ import androidx.work.WorkerParameters
+ import androidx.work.workDataOf
+ import dagger.assisted.Assisted
+ import dagger.assisted.AssistedInject
+-import java.util.concurrent.TimeUnit
+-import java.util.concurrent.TimeUnit.MINUTES
++import java.util.concurrent.TimeUnit.MILLISECONDS
+ import kotlinx.coroutines.currentCoroutineContext
+ import kotlinx.coroutines.ensureActive
+ import kotlinx.coroutines.flow.Flow
+@@ -33,7 +32,9 @@ import org.fdroid.NotificationManager.Companion.NOTIFICATION_ID_REPO_UPDATE
+ import org.fdroid.history.HistoryManager
+ import org.fdroid.install.CacheCleaner
+ import org.fdroid.settings.SettingsConstants.AutoUpdateValues
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_REPO_UPDATE_INTERVAL
+ import org.fdroid.ui.utils.canStartForegroundService
++import org.fdroid.utils.getPeriodicWorkInterval
+ 
+ private val TAG = RepoUpdateWorker::class.java.simpleName
+ 
+@@ -72,7 +73,12 @@ constructor(
+     }
+ 
+     @JvmStatic
+-    fun scheduleOrCancel(context: Context, autoUpdate: AutoUpdateValues) {
++    @JvmOverloads
++    fun scheduleOrCancel(
++      context: Context,
++      autoUpdate: AutoUpdateValues,
++      intervalMinutes: Int = PREF_DEFAULT_REPO_UPDATE_INTERVAL,
++    ) {
+       val workManager = WorkManager.getInstance(context)
+       if (autoUpdate.workerEnabled) {
+         Log.i(TAG, "scheduleOrCancel: enqueueUniquePeriodicWork")
+@@ -88,12 +94,13 @@ constructor(
+             .setRequiresStorageNotLow(true)
+             .setRequiredNetworkType(networkType)
+             .build()
++        val interval = getPeriodicWorkInterval(intervalMinutes, defaultFlexMinutes = 15)
+         val workRequest =
+           PeriodicWorkRequestBuilder<RepoUpdateWorker>(
+-              repeatInterval = 4,
+-              repeatIntervalTimeUnit = TimeUnit.HOURS,
+-              flexTimeInterval = 15,
+-              flexTimeIntervalUnit = MINUTES,
++              repeatInterval = interval.intervalMillis,
++              repeatIntervalTimeUnit = MILLISECONDS,
++              flexTimeInterval = interval.flexMillis,
++              flexTimeIntervalUnit = MILLISECONDS,
+             )
+             .setConstraints(constraints)
+             .build()
+diff --git a/app/src/main/kotlin/org/fdroid/settings/SettingsConstants.kt b/app/src/main/kotlin/org/fdroid/settings/SettingsConstants.kt
+index 514a979..06b1ce2 100644
+--- a/app/src/main/kotlin/org/fdroid/settings/SettingsConstants.kt
++++ b/app/src/main/kotlin/org/fdroid/settings/SettingsConstants.kt
+@@ -22,6 +22,8 @@ object SettingsConstants {
+     Always(true),
+     OnlyWhenOpenApp(false),
+     Never(false),
++    /** Only for app updates: install updates right after each successful repo update. */
++    Immediately(false),
+   }
+ 
+   const val PREF_KEY_REPO_AUTO_UPDATES = "repoAutoUpdates"
+@@ -30,6 +32,18 @@ object SettingsConstants {
+   const val PREF_KEY_APP_AUTO_UPDATES = "appAutoUpdates"
+   val PREF_DEFAULT_APP_AUTO_UPDATES = AutoUpdateValues.OnlyWifi.name
+ 
++  const val PREF_KEY_REPO_UPDATE_INTERVAL = "repoUpdateIntervalMinutes"
++  const val PREF_DEFAULT_REPO_UPDATE_INTERVAL = 240
++
++  const val PREF_KEY_APP_UPDATE_INTERVAL = "appUpdateIntervalMinutes"
++  const val PREF_DEFAULT_APP_UPDATE_INTERVAL = 1440
++
++  const val PREF_KEY_APP_UPDATE_REQUIRES_CHARGING = "appUpdateRequiresCharging"
++  const val PREF_DEFAULT_APP_UPDATE_REQUIRES_CHARGING = false
++
++  const val PREF_KEY_APP_UPDATE_REQUIRES_IDLE = "appUpdateRequiresIdle"
++  const val PREF_DEFAULT_APP_UPDATE_REQUIRES_IDLE = false
++
+   enum class MirrorChooserValues {
+     Random {
+       override val res = R.string.pref_mirror_chooser_summary_random
+@@ -102,6 +116,18 @@ fun String?.toAutoUpdateValue() =
+     AutoUpdateValues.OnlyWifi
+   }
+ 
++/** Like [toAutoUpdateValue], but falls back to the default for values not valid for repos. */
++fun String?.toRepoAutoUpdateValue() =
++  toAutoUpdateValue().let {
++    if (it == AutoUpdateValues.Immediately) AutoUpdateValues.OnlyWifi else it
++  }
++
++/** Like [toAutoUpdateValue], but falls back to the default for values not valid for apps. */
++fun String?.toAppAutoUpdateValue() =
++  toAutoUpdateValue().let {
++    if (it == AutoUpdateValues.OnlyWhenOpenApp) AutoUpdateValues.OnlyWifi else it
++  }
++
+ fun String?.toMirrorChooserValue() =
+   try {
+     if (this == null) MirrorChooserValues.Random else MirrorChooserValues.valueOf(this)
+diff --git a/app/src/main/kotlin/org/fdroid/settings/SettingsManager.kt b/app/src/main/kotlin/org/fdroid/settings/SettingsManager.kt
+index a6aafa7..79630a9 100644
+--- a/app/src/main/kotlin/org/fdroid/settings/SettingsManager.kt
++++ b/app/src/main/kotlin/org/fdroid/settings/SettingsManager.kt
+@@ -24,6 +24,9 @@ import org.fdroid.settings.SettingsConstants.AutoUpdateValues
+ import org.fdroid.settings.SettingsConstants.MirrorChooserValues
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_AUTO_UPDATES
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_LIST_SORT_ORDER
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_UPDATE_INTERVAL
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_UPDATE_REQUIRES_CHARGING
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_UPDATE_REQUIRES_IDLE
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_DYNAMIC_COLORS
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_INSTALL_HISTORY
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_LAST_DB_REPAIR_CHECK
+@@ -34,6 +37,7 @@ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_PREVENT_SCREENSHOTS
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_PRIVILEGED_EXTENSION_NEEDS_MIGRATION
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_PROXY
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_REPO_AUTO_UPDATES
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_REPO_UPDATE_INTERVAL
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_SHOW_INCOMPATIBLE
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_SHOW_SEARCH_KEYBOARD
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_THEME
+@@ -42,6 +46,9 @@ import org.fdroid.settings.SettingsConstants.PREF_DNS_CACHE
+ import org.fdroid.settings.SettingsConstants.PREF_DNS_CACHE_DEFAULT
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_AUTO_UPDATES
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_LIST_SORT_ORDER
++import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_UPDATE_INTERVAL
++import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_UPDATE_REQUIRES_CHARGING
++import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_UPDATE_REQUIRES_IDLE
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_DYNAMIC_COLORS
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_IGNORED_APP_ISSUES
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_INSTALL_HISTORY
+@@ -53,6 +60,7 @@ import org.fdroid.settings.SettingsConstants.PREF_KEY_PREVENT_SCREENSHOTS
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_PRIVILEGED_EXTENSION_NEEDS_MIGRATION
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_PROXY
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_REPO_AUTO_UPDATES
++import org.fdroid.settings.SettingsConstants.PREF_KEY_REPO_UPDATE_INTERVAL
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_SHOW_INCOMPATIBLE
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_SHOW_SEARCH_KEYBOARD
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_THEME
+@@ -88,22 +96,71 @@ class SettingsManager @Inject constructor(@param:ApplicationContext private val
+     get() =
+       prefs
+         .getString(PREF_KEY_REPO_AUTO_UPDATES, PREF_DEFAULT_REPO_AUTO_UPDATES)
+-        .toAutoUpdateValue()
++        .toRepoAutoUpdateValue()
+ 
+   val repoUpdatesFlow
+     get() =
+       prefsFlow
+-        .map { it.get<String>(PREF_KEY_REPO_AUTO_UPDATES).toAutoUpdateValue() }
++        .map { it.get<String>(PREF_KEY_REPO_AUTO_UPDATES).toRepoAutoUpdateValue() }
+         .distinctUntilChanged()
+ 
+   val autoUpdateApps
+     get() =
+-      prefs.getString(PREF_KEY_APP_AUTO_UPDATES, PREF_DEFAULT_APP_AUTO_UPDATES).toAutoUpdateValue()
++      prefs
++        .getString(PREF_KEY_APP_AUTO_UPDATES, PREF_DEFAULT_APP_AUTO_UPDATES)
++        .toAppAutoUpdateValue()
+ 
+   val autoUpdateAppsFlow
+     get() =
+       prefsFlow
+-        .map { it.get<String>(PREF_KEY_APP_AUTO_UPDATES).toAutoUpdateValue() }
++        .map { it.get<String>(PREF_KEY_APP_AUTO_UPDATES).toAppAutoUpdateValue() }
++        .distinctUntilChanged()
++
++  val repoUpdateIntervalMinutes: Int
++    get() = prefs.getInt(PREF_KEY_REPO_UPDATE_INTERVAL, PREF_DEFAULT_REPO_UPDATE_INTERVAL)
++
++  val repoUpdateIntervalMinutesFlow: Flow<Int>
++    get() =
++      prefsFlow
++        .map { it.get<Int>(PREF_KEY_REPO_UPDATE_INTERVAL) ?: PREF_DEFAULT_REPO_UPDATE_INTERVAL }
++        .distinctUntilChanged()
++
++  val appUpdateIntervalMinutes: Int
++    get() = prefs.getInt(PREF_KEY_APP_UPDATE_INTERVAL, PREF_DEFAULT_APP_UPDATE_INTERVAL)
++
++  val appUpdateIntervalMinutesFlow: Flow<Int>
++    get() =
++      prefsFlow
++        .map { it.get<Int>(PREF_KEY_APP_UPDATE_INTERVAL) ?: PREF_DEFAULT_APP_UPDATE_INTERVAL }
++        .distinctUntilChanged()
++
++  val appUpdateRequiresCharging: Boolean
++    get() =
++      prefs.getBoolean(
++        PREF_KEY_APP_UPDATE_REQUIRES_CHARGING,
++        PREF_DEFAULT_APP_UPDATE_REQUIRES_CHARGING,
++      )
++
++  val appUpdateRequiresChargingFlow: Flow<Boolean>
++    get() =
++      prefsFlow
++        .map {
++          it.get<Boolean>(PREF_KEY_APP_UPDATE_REQUIRES_CHARGING)
++            ?: PREF_DEFAULT_APP_UPDATE_REQUIRES_CHARGING
++        }
++        .distinctUntilChanged()
++
++  val appUpdateRequiresIdle: Boolean
++    get() =
++      prefs.getBoolean(PREF_KEY_APP_UPDATE_REQUIRES_IDLE, PREF_DEFAULT_APP_UPDATE_REQUIRES_IDLE)
++
++  val appUpdateRequiresIdleFlow: Flow<Boolean>
++    get() =
++      prefsFlow
++        .map {
++          it.get<Boolean>(PREF_KEY_APP_UPDATE_REQUIRES_IDLE)
++            ?: PREF_DEFAULT_APP_UPDATE_REQUIRES_IDLE
++        }
+         .distinctUntilChanged()
+ 
+   var lastRepoUpdate: Long
+diff --git a/app/src/main/kotlin/org/fdroid/ui/settings/DurationPreference.kt b/app/src/main/kotlin/org/fdroid/ui/settings/DurationPreference.kt
+new file mode 100644
+index 0000000..eff2d2a
+--- /dev/null
++++ b/app/src/main/kotlin/org/fdroid/ui/settings/DurationPreference.kt
+@@ -0,0 +1,209 @@
++package org.fdroid.ui.settings
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.LazyListScope
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Schedule
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.MutableState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.semantics.hideFromAccessibility
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.tooling.preview.Preview
++import androidx.compose.ui.unit.dp
++import me.zhanghai.compose.preference.Preference
++import me.zhanghai.compose.preference.ProvidePreferenceLocals
++import me.zhanghai.compose.preference.rememberPreferenceState
++import org.fdroid.R
++import org.fdroid.ui.FDroidContent
++
++/** The minimum interval WorkManager allows for periodic work, in minutes. */
++internal const val MIN_DURATION_MINUTES = 15
++private const val MAX_HOURS = 999
++private const val MAX_MINUTES = 59
++
++/**
++ * A preference storing a duration in minutes (as [Int]) which shows a summary like "Every 2 h 30"
++ * and opens a dialog to enter hours and minutes. Durations below [MIN_DURATION_MINUTES] are
++ * rejected.
++ */
++fun LazyListScope.durationPreference(
++  key: String,
++  defaultValue: Int,
++  title: @Composable () -> Unit,
++  icon: @Composable (() -> Unit)? = {
++    Icon(
++      imageVector = Icons.Default.Schedule,
++      contentDescription = null,
++      modifier = Modifier.semantics { hideFromAccessibility() },
++    )
++  },
++) {
++  item(key = key, contentType = "DurationPreference") {
++    val state = rememberPreferenceState(key, defaultValue)
++    DurationPreference(state = state, title = title, icon = icon)
++  }
++}
++
++@Composable
++fun DurationPreference(
++  state: MutableState<Int>,
++  title: @Composable () -> Unit,
++  icon: @Composable (() -> Unit)? = null,
++) {
++  var showDialog by rememberSaveable { mutableStateOf(false) }
++  Preference(
++    title = title,
++    icon = icon,
++    summary = { Text(stringResource(R.string.duration_every, formatDuration(state.value))) },
++    onClick = { showDialog = true },
++  )
++  if (showDialog) {
++    DurationDialog(
++      title = title,
++      initialMinutes = state.value,
++      onConfirm = { minutes ->
++        state.value = minutes
++        showDialog = false
++      },
++      onDismissRequest = { showDialog = false },
++    )
++  }
++}
++
++@Composable
++private fun DurationDialog(
++  title: @Composable () -> Unit,
++  initialMinutes: Int,
++  onConfirm: (Int) -> Unit,
++  onDismissRequest: () -> Unit,
++) {
++  var hours by rememberSaveable { mutableStateOf((initialMinutes / 60).toString()) }
++  var minutes by rememberSaveable { mutableStateOf((initialMinutes % 60).toString()) }
++  val totalMinutes = parseDuration(hours, minutes)
++  val minutesInvalid = (minutes.toIntOrNull() ?: 0) > MAX_MINUTES
++  AlertDialog(
++    onDismissRequest = onDismissRequest,
++    title = title,
++    text = {
++      Column {
++        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++          OutlinedTextField(
++            value = hours,
++            onValueChange = { hours = it.filter(Char::isDigit).take(3) },
++            label = { Text(stringResource(R.string.duration_hours)) },
++            singleLine = true,
++            isError = totalMinutes == null && !minutesInvalid,
++            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
++            modifier = Modifier.weight(1f),
++          )
++          OutlinedTextField(
++            value = minutes,
++            onValueChange = { minutes = it.filter(Char::isDigit).take(2) },
++            label = { Text(stringResource(R.string.duration_minutes)) },
++            singleLine = true,
++            isError = totalMinutes == null,
++            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
++            modifier = Modifier.weight(1f),
++          )
++        }
++        if (totalMinutes == null) {
++          val error =
++            if (minutesInvalid) {
++              stringResource(R.string.duration_error_minutes, MAX_MINUTES)
++            } else {
++              stringResource(R.string.duration_error_minimum, MIN_DURATION_MINUTES)
++            }
++          Text(
++            text = error,
++            color = MaterialTheme.colorScheme.error,
++            style = MaterialTheme.typography.bodySmall,
++            modifier = Modifier.padding(top = 8.dp),
++          )
++        }
++      }
++    },
++    confirmButton = {
++      TextButton(onClick = { totalMinutes?.let(onConfirm) }, enabled = totalMinutes != null) {
++        Text(stringResource(android.R.string.ok))
++      }
++    },
++    dismissButton = {
++      TextButton(onClick = onDismissRequest) { Text(stringResource(android.R.string.cancel)) }
++    },
++  )
++}
++
++/** Formats the given duration in [minutes] like "2 h 30", "4 h" or "45 min". */
++internal fun formatDuration(minutes: Int): String {
++  val h = minutes / 60
++  val m = minutes % 60
++  return when {
++    h > 0 && m > 0 -> "$h h ${m.toString().padStart(2, '0')}"
++    h > 0 -> "$h h"
++    else -> "$m min"
++  }
++}
++
++/**
++ * Parses the given [hours] (0-999) and [minutes] (0-59) input. Empty input is treated as 0.
++ *
++ * @return the total duration in minutes or null if the input is invalid or the duration is below
++ *   [MIN_DURATION_MINUTES].
++ */
++internal fun parseDuration(hours: String, minutes: String): Int? {
++  val h = if (hours.isBlank()) 0 else hours.trim().toIntOrNull() ?: return null
++  val m = if (minutes.isBlank()) 0 else minutes.trim().toIntOrNull() ?: return null
++  if (h !in 0..MAX_HOURS || m !in 0..MAX_MINUTES) return null
++  val total = h * 60 + m
++  return if (total < MIN_DURATION_MINUTES) null else total
++}
++
++@Preview
++@Composable
++private fun DurationPreferencePreview() {
++  FDroidContent {
++    ProvidePreferenceLocals {
++      val state = remember { mutableStateOf(150) }
++      LazyColumn {
++        item {
++          DurationPreference(
++            state = state,
++            title = { Text(stringResource(R.string.pref_repo_update_interval_title)) },
++          )
++        }
++      }
++    }
++  }
++}
++
++@Preview
++@Composable
++private fun DurationDialogPreview() {
++  FDroidContent {
++    DurationDialog(
++      title = { Text(stringResource(R.string.pref_app_update_interval_title)) },
++      initialMinutes = 10,
++      onConfirm = {},
++      onDismissRequest = {},
++    )
++  }
++}
+diff --git a/app/src/main/kotlin/org/fdroid/ui/settings/Settings.kt b/app/src/main/kotlin/org/fdroid/ui/settings/Settings.kt
+index 7c9ee24..946f72e 100644
+--- a/app/src/main/kotlin/org/fdroid/ui/settings/Settings.kt
++++ b/app/src/main/kotlin/org/fdroid/ui/settings/Settings.kt
+@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.Android
++import androidx.compose.material.icons.filled.BatteryChargingFull
++import androidx.compose.material.icons.filled.Bedtime
+ import androidx.compose.material.icons.filled.BrightnessMedium
+ import androidx.compose.material.icons.filled.BugReport
+ import androidx.compose.material.icons.filled.ColorLens
+@@ -65,28 +67,39 @@ import me.zhanghai.compose.preference.switchPreference
+ import org.fdroid.R
+ import org.fdroid.settings.SettingsConstants.AutoUpdateValues
+ import org.fdroid.settings.SettingsConstants.AutoUpdateValues.Always
++import org.fdroid.settings.SettingsConstants.AutoUpdateValues.Immediately
+ import org.fdroid.settings.SettingsConstants.AutoUpdateValues.Never
+ import org.fdroid.settings.SettingsConstants.AutoUpdateValues.OnlyWhenOpenApp
+ import org.fdroid.settings.SettingsConstants.AutoUpdateValues.OnlyWifi
+ import org.fdroid.settings.SettingsConstants.MirrorChooserValues
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_AUTO_UPDATES
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_UPDATE_INTERVAL
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_UPDATE_REQUIRES_CHARGING
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_UPDATE_REQUIRES_IDLE
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_DYNAMIC_COLORS
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_MIRROR_CHOOSER
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_PREVENT_SCREENSHOTS
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_PROXY
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_REPO_AUTO_UPDATES
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_REPO_UPDATE_INTERVAL
+ import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_THEME
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_AUTO_UPDATES
++import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_UPDATE_INTERVAL
++import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_UPDATE_REQUIRES_CHARGING
++import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_UPDATE_REQUIRES_IDLE
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_DYNAMIC_COLORS
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_MIRROR_CHOOSER
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_PREVENT_SCREENSHOTS
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_PROXY
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_REPO_AUTO_UPDATES
++import org.fdroid.settings.SettingsConstants.PREF_KEY_REPO_UPDATE_INTERVAL
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_THEME
+ import org.fdroid.settings.SettingsConstants.PREF_USE_DNS_CACHE
+ import org.fdroid.settings.SettingsConstants.PREF_USE_DNS_CACHE_DEFAULT
++import org.fdroid.settings.toAppAutoUpdateValue
+ import org.fdroid.settings.toAutoUpdateValue
+ import org.fdroid.settings.toMirrorChooserValue
++import org.fdroid.settings.toRepoAutoUpdateValue
+ import org.fdroid.ui.FDroidContent
+ import org.fdroid.ui.utils.BackButton
+ import org.fdroid.ui.utils.asRelativeTimeString
+@@ -118,6 +131,10 @@ fun Settings(
+     ProvidePreferenceLocals(model.prefsFlow) {
+       val showProxyError = remember { mutableStateOf(false) }
+       val proxyState = rememberPreferenceState(PREF_KEY_PROXY, PREF_DEFAULT_PROXY)
++      val repoUpdatesState =
++        rememberPreferenceState(PREF_KEY_REPO_AUTO_UPDATES, PREF_DEFAULT_REPO_AUTO_UPDATES)
++      val appUpdatesState =
++        rememberPreferenceState(PREF_KEY_APP_AUTO_UPDATES, PREF_DEFAULT_APP_AUTO_UPDATES)
+       LazyColumn(modifier = Modifier.padding(paddingValues).fillMaxSize()) {
+         preferenceCategory(
+           key = "pref_category_display",
+@@ -241,7 +258,7 @@ fun Settings(
+               )
+           },
+           summary = { strValue ->
+-            val value = strValue.toAutoUpdateValue()
++            val value = strValue.toRepoAutoUpdateValue()
+             if (value.workerEnabled) {
+               val nextUpdate = model.nextRepoUpdateFlow.collectAsState(Long.MAX_VALUE).value
+               val nextUpdateStr =
+@@ -272,7 +289,8 @@ fun Settings(
+               Text(text = s, color = MaterialTheme.colorScheme.error)
+             }
+           },
+-          values = AutoUpdateValues.entries.map { it.name },
++          // Exclude the Immediately option here, as it is only for app updates
++          values = AutoUpdateValues.entries.mapNotNull { if (it == Immediately) null else it.name },
+           valueToText = { value: String ->
+             AnnotatedString(
+               when (value.toAutoUpdateValue()) {
+@@ -280,10 +298,18 @@ fun Settings(
+                 Always -> res.getString(R.string.pref_auto_updates_only_always)
+                 OnlyWhenOpenApp -> res.getString(R.string.pref_auto_updates_only_only_when_open_app)
+                 Never -> res.getString(R.string.pref_auto_updates_only_never)
++                Immediately -> res.getString(R.string.pref_auto_updates_immediately)
+               }
+             )
+           },
+         )
++        if (repoUpdatesState.value.toRepoAutoUpdateValue().workerEnabled) {
++          durationPreference(
++            key = PREF_KEY_REPO_UPDATE_INTERVAL,
++            defaultValue = PREF_DEFAULT_REPO_UPDATE_INTERVAL,
++            title = { Text(stringResource(R.string.pref_repo_update_interval_title)) },
++          )
++        }
+         listPreference(
+           key = PREF_KEY_APP_AUTO_UPDATES,
+           defaultValue = PREF_DEFAULT_APP_AUTO_UPDATES,
+@@ -307,8 +333,9 @@ fun Settings(
+             )
+           },
+           summary = { strValue ->
++            val value = strValue.toAppAutoUpdateValue()
+             val s =
+-              if (strValue != Never.name) {
++              if (value.workerEnabled) {
+                 val nextUpdate = model.nextAppUpdateFlow.collectAsState(Long.MAX_VALUE).value
+                 val nextUpdateStr =
+                   if (nextUpdate == Long.MAX_VALUE) {
+@@ -322,12 +349,14 @@ fun Settings(
+                     stringResource(R.string.auto_update_time, nextUpdate.asRelativeTimeString())
+                   }
+                 val s =
+-                  if (strValue == OnlyWifi.name) {
++                  if (value == OnlyWifi) {
+                     stringResource(R.string.pref_auto_updates_summary_only_wifi)
+-                  } else if (strValue == Always.name) {
++                  } else if (value == Always) {
+                     stringResource(R.string.pref_auto_updates_summary_always)
+                   } else error("Unknown value: $strValue")
+                 s + "\n" + nextUpdateStr
++              } else if (value == Immediately) {
++                stringResource(R.string.pref_auto_updates_summary_immediately)
+               } else {
+                 stringResource(R.string.pref_auto_updates_summary_never)
+               }
+@@ -339,9 +368,8 @@ fun Settings(
+               }
+             Text(s, color = textColor)
+           },
+-          // Exclude the OnlyWhenOpenApp option here
+-          values =
+-            AutoUpdateValues.entries.mapNotNull { if (it == OnlyWhenOpenApp) null else it.name },
++          // Exclude the OnlyWhenOpenApp option here, order: off, after search, separate timer
++          values = listOf(Never, Immediately, OnlyWifi, Always).map { it.name },
+           valueToText = { value: String ->
+             AnnotatedString(
+               when (value.toAutoUpdateValue()) {
+@@ -349,10 +377,44 @@ fun Settings(
+                 Always -> res.getString(R.string.pref_auto_updates_only_always)
+                 OnlyWhenOpenApp -> res.getString(R.string.pref_auto_updates_only_only_when_open_app)
+                 Never -> res.getString(R.string.pref_auto_updates_only_never)
++                Immediately -> res.getString(R.string.pref_auto_updates_immediately)
+               }
+             )
+           },
+         )
++        if (appUpdatesState.value.toAppAutoUpdateValue().workerEnabled) {
++          durationPreference(
++            key = PREF_KEY_APP_UPDATE_INTERVAL,
++            defaultValue = PREF_DEFAULT_APP_UPDATE_INTERVAL,
++            title = { Text(stringResource(R.string.pref_app_update_interval_title)) },
++          )
++          switchPreference(
++            key = PREF_KEY_APP_UPDATE_REQUIRES_CHARGING,
++            defaultValue = PREF_DEFAULT_APP_UPDATE_REQUIRES_CHARGING,
++            title = { Text(stringResource(R.string.pref_app_update_requires_charging_title)) },
++            icon = {
++              Icon(
++                imageVector = Icons.Default.BatteryChargingFull,
++                contentDescription = null,
++                modifier = Modifier.semantics { hideFromAccessibility() },
++              )
++            },
++            summary = { Text(stringResource(R.string.pref_app_update_requires_charging_summary)) },
++          )
++          switchPreference(
++            key = PREF_KEY_APP_UPDATE_REQUIRES_IDLE,
++            defaultValue = PREF_DEFAULT_APP_UPDATE_REQUIRES_IDLE,
++            title = { Text(stringResource(R.string.pref_app_update_requires_idle_title)) },
++            icon = {
++              Icon(
++                imageVector = Icons.Default.Bedtime,
++                contentDescription = null,
++                modifier = Modifier.semantics { hideFromAccessibility() },
++              )
++            },
++            summary = { Text(stringResource(R.string.pref_app_update_requires_idle_summary)) },
++          )
++        }
+         preferenceCategory(
+           key = "pref_category_network",
+           title = { Text(stringResource(R.string.pref_category_network)) },
+diff --git a/app/src/main/kotlin/org/fdroid/ui/settings/SettingsViewModel.kt b/app/src/main/kotlin/org/fdroid/ui/settings/SettingsViewModel.kt
+index 11a5a65..2283e37 100644
+--- a/app/src/main/kotlin/org/fdroid/ui/settings/SettingsViewModel.kt
++++ b/app/src/main/kotlin/org/fdroid/ui/settings/SettingsViewModel.kt
+@@ -17,12 +17,14 @@ import java.io.IOException
+ import java.lang.Runtime.getRuntime
+ import javax.inject.Inject
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.combine
+ import kotlinx.coroutines.flow.drop
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import mu.KotlinLogging
+ import org.fdroid.R
+ import org.fdroid.repo.RepoUpdateWorker
++import org.fdroid.settings.SettingsConstants.AutoUpdateValues
+ import org.fdroid.settings.SettingsManager
+ import org.fdroid.ui.utils.applyNewTheme
+ import org.fdroid.updates.AppUpdateWorker
+@@ -54,16 +56,37 @@ constructor(
+       settingsManager.themeFlow.drop(1).collect { if (it != null) applyNewTheme(it) }
+     }
+     viewModelScope.launch {
+-      // react to repo auto update changes
+-      settingsManager.repoUpdatesFlow.drop(1).collect { value ->
+-        RepoUpdateWorker.scheduleOrCancel(application, value)
+-      }
++      // react to repo auto update changes (mode or interval)
++      combine(settingsManager.repoUpdatesFlow, settingsManager.repoUpdateIntervalMinutesFlow) {
++          value,
++          intervalMinutes ->
++          Pair(value, intervalMinutes)
++        }
++        .drop(1)
++        .collect { (value, intervalMinutes) ->
++          RepoUpdateWorker.scheduleOrCancel(application, value, intervalMinutes)
++        }
+     }
+     viewModelScope.launch {
+-      // react to app auto update changes
+-      settingsManager.autoUpdateAppsFlow.drop(1).collect { value ->
+-        AppUpdateWorker.scheduleOrCancel(application, value)
+-      }
++      // react to app auto update changes (mode, interval or constraints)
++      combine(
++          settingsManager.autoUpdateAppsFlow,
++          settingsManager.appUpdateIntervalMinutesFlow,
++          settingsManager.appUpdateRequiresChargingFlow,
++          settingsManager.appUpdateRequiresIdleFlow,
++        ) { value, intervalMinutes, requiresCharging, requiresIdle ->
++          AppUpdateSchedule(value, intervalMinutes, requiresCharging, requiresIdle)
++        }
++        .drop(1)
++        .collect { s ->
++          AppUpdateWorker.scheduleOrCancel(
++            context = application,
++            autoUpdate = s.autoUpdate,
++            intervalMinutes = s.intervalMinutes,
++            requiresCharging = s.requiresCharging,
++            requiresIdle = s.requiresIdle,
++          )
++        }
+     }
+   }
+ 
+@@ -114,4 +137,11 @@ constructor(
+   private suspend fun sendToast(@StringRes s: Int, duration: Int = LENGTH_SHORT) {
+     withContext(Dispatchers.Main) { Toast.makeText(application, s, duration).show() }
+   }
++
++  private data class AppUpdateSchedule(
++    val autoUpdate: AutoUpdateValues,
++    val intervalMinutes: Int,
++    val requiresCharging: Boolean,
++    val requiresIdle: Boolean,
++  )
+ }
+diff --git a/app/src/main/kotlin/org/fdroid/updates/AppUpdateWorker.kt b/app/src/main/kotlin/org/fdroid/updates/AppUpdateWorker.kt
+index 42892c5..9ef87a5 100644
+--- a/app/src/main/kotlin/org/fdroid/updates/AppUpdateWorker.kt
++++ b/app/src/main/kotlin/org/fdroid/updates/AppUpdateWorker.kt
+@@ -28,7 +28,11 @@ import org.fdroid.NotificationManager.Companion.NOTIFICATION_ID_APP_INSTALLS
+ import org.fdroid.install.AppInstallManager
+ import org.fdroid.install.InstallNotificationState
+ import org.fdroid.settings.SettingsConstants.AutoUpdateValues
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_UPDATE_INTERVAL
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_UPDATE_REQUIRES_CHARGING
++import org.fdroid.settings.SettingsConstants.PREF_DEFAULT_APP_UPDATE_REQUIRES_IDLE
+ import org.fdroid.ui.utils.canStartForegroundService
++import org.fdroid.utils.getPeriodicWorkInterval
+ 
+ @HiltWorker
+ class AppUpdateWorker
+@@ -47,7 +51,14 @@ constructor(
+     @VisibleForTesting internal const val UNIQUE_WORK_NAME_APP_UPDATE = "autoAppUpdate"
+ 
+     @JvmStatic
+-    fun scheduleOrCancel(context: Context, autoUpdate: AutoUpdateValues) {
++    @JvmOverloads
++    fun scheduleOrCancel(
++      context: Context,
++      autoUpdate: AutoUpdateValues,
++      intervalMinutes: Int = PREF_DEFAULT_APP_UPDATE_INTERVAL,
++      requiresCharging: Boolean = PREF_DEFAULT_APP_UPDATE_REQUIRES_CHARGING,
++      requiresIdle: Boolean = PREF_DEFAULT_APP_UPDATE_REQUIRES_IDLE,
++    ) {
+       val workManager = WorkManager.getInstance(context)
+       if (autoUpdate.workerEnabled) {
+         Log.i(TAG, "scheduleOrCancel: enqueueUniquePeriodicWork")
+@@ -61,15 +72,17 @@ constructor(
+           Constraints.Builder()
+             .setRequiresBatteryNotLow(true)
+             .setRequiresStorageNotLow(true)
+-            .setRequiresDeviceIdle(true)
++            .setRequiresCharging(requiresCharging)
++            .setRequiresDeviceIdle(requiresIdle)
+             .setRequiredNetworkType(networkType)
+             .build()
++        val interval = getPeriodicWorkInterval(intervalMinutes, defaultFlexMinutes = 60)
+         val workRequest =
+           PeriodicWorkRequestBuilder<AppUpdateWorker>(
+-              repeatInterval = TimeUnit.HOURS.toMillis(24),
++              repeatInterval = interval.intervalMillis,
+               repeatIntervalTimeUnit = TimeUnit.MILLISECONDS,
+-              flexTimeInterval = 60,
+-              flexTimeIntervalUnit = TimeUnit.MINUTES,
++              flexTimeInterval = interval.flexMillis,
++              flexTimeIntervalUnit = TimeUnit.MILLISECONDS,
+             )
+             .setConstraints(constraints)
+             .build()
+diff --git a/app/src/main/kotlin/org/fdroid/utils/PeriodicWorkInterval.kt b/app/src/main/kotlin/org/fdroid/utils/PeriodicWorkInterval.kt
+new file mode 100644
+index 0000000..ce305e3
+--- /dev/null
++++ b/app/src/main/kotlin/org/fdroid/utils/PeriodicWorkInterval.kt
+@@ -0,0 +1,25 @@
++package org.fdroid.utils
++
++import androidx.work.PeriodicWorkRequest.Companion.MIN_PERIODIC_FLEX_MILLIS
++import androidx.work.PeriodicWorkRequest.Companion.MIN_PERIODIC_INTERVAL_MILLIS
++import java.util.concurrent.TimeUnit.MINUTES
++
++/** Repeat interval and flex interval (both in milliseconds) of a periodic work request. */
++data class PeriodicWorkInterval(val intervalMillis: Long, val flexMillis: Long)
++
++/**
++ * Computes a valid [PeriodicWorkInterval] for the given user-chosen [intervalMinutes].
++ *
++ * The interval is clamped to at least [MIN_PERIODIC_INTERVAL_MILLIS] (15 minutes). The flex
++ * interval is [defaultFlexMinutes], but never longer than the interval itself and never shorter
++ * than [MIN_PERIODIC_FLEX_MILLIS].
++ */
++fun getPeriodicWorkInterval(intervalMinutes: Int, defaultFlexMinutes: Int): PeriodicWorkInterval {
++  val intervalMillis =
++    MINUTES.toMillis(intervalMinutes.toLong()).coerceAtLeast(MIN_PERIODIC_INTERVAL_MILLIS)
++  val flexMillis =
++    MINUTES.toMillis(defaultFlexMinutes.toLong())
++      .coerceAtMost(intervalMillis)
++      .coerceAtLeast(MIN_PERIODIC_FLEX_MILLIS)
++  return PeriodicWorkInterval(intervalMillis, flexMillis)
++}
+diff --git a/app/src/main/res/values-fr/strings.xml b/app/src/main/res/values-fr/strings.xml
+index 1926e5d..32c8885 100644
+--- a/app/src/main/res/values-fr/strings.xml
++++ b/app/src/main/res/values-fr/strings.xml
+@@ -320,13 +320,26 @@
+     <string name="pref_auto_updates_only_wifi">Seulement sur le Wi-Fi</string>
+     <string name="pref_auto_updates_only_always">Toujours (même sur le réseau mobile)</string>
+     <string name="pref_auto_updates_only_never">Jamais</string>
+-    <string name="pref_auto_updates_summary_only_wifi">Télécharger et mettre à jour les applications quotidiennement sur le Wi-Fi et que l\'appareil n\'est pas utilisé</string>
+-    <string name="pref_auto_updates_summary_always">Télécharger et mettre à jour les applications quotidiennement même sur le réseau mobile et que l\'appareil n\'est pas utilisé</string>
++    <string name="pref_auto_updates_summary_only_wifi">Télécharger et mettre à jour les applications périodiquement (minuterie séparée), seulement en Wi-Fi</string>
++    <string name="pref_auto_updates_summary_always">Télécharger et mettre à jour les applications périodiquement (minuterie séparée), même sur le réseau mobile</string>
+     <string name="pref_auto_updates_summary_never">Mise à jour automatique désactivée • Les applications doivent être mises à jour manuellement</string>
+     <string name="pref_repo_updates_title">Vérifier les mises à jour</string>
+     <string name="pref_repo_updates_summary_only_wifi">Vérifier périodiquement les mises à jour d\'applications depuis les dépôts seulement en Wi-Fi</string>
+     <string name="pref_repo_updates_summary_always">Vérifier périodiquement les mises à jour d\'applications depuis les dépôts même sur le réseau mobile</string>
+     <string name="pref_repo_updates_summary_never">Ne pas vérifier les mises à jour • Les applications deviendront obsolètes</string>
++    <string name="pref_auto_updates_immediately">Juste après chaque recherche de mises à jour</string>
++    <string name="pref_auto_updates_summary_immediately">Télécharger et mettre à jour les applications juste après chaque recherche de mises à jour réussie</string>
++    <string name="pref_repo_update_interval_title">Intervalle de recherche</string>
++    <string name="pref_app_update_interval_title">Intervalle d\'installation</string>
++    <string name="pref_app_update_requires_charging_title">Seulement en charge</string>
++    <string name="pref_app_update_requires_charging_summary">Installer les mises à jour seulement quand l\'appareil est en charge</string>
++    <string name="pref_app_update_requires_idle_title">Seulement si l\'appareil est inactif</string>
++    <string name="pref_app_update_requires_idle_summary">Installer les mises à jour seulement quand l\'appareil n\'est pas utilisé • Peut beaucoup retarder les mises à jour</string>
++    <string name="duration_every">Toutes les %s</string>
++    <string name="duration_hours">Heures</string>
++    <string name="duration_minutes">Minutes</string>
++    <string name="duration_error_minimum">Le minimum est de %d minutes</string>
++    <string name="duration_error_minutes">Les minutes doivent être comprises entre 0 et %d</string>
+     <string name="pref_category_network">Réseau</string>
+     <string name="pref_mirror_chooser_title">Télécharger une sélection de miroirs</string>
+     <string name="pref_mirror_chooser_summary_random">Aléatoire</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 83817d0..5c1bb5e 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -137,14 +137,27 @@
+     <string name="pref_auto_updates_only_always">Always (even on mobile data)</string>
+     <string name="pref_auto_updates_only_only_when_open_app">Only when opening the app</string>
+     <string name="pref_auto_updates_only_never">Never</string>
+-    <string name="pref_auto_updates_summary_only_wifi">Download and update apps daily when on Wi-Fi and the device isn\'t being used</string>
+-    <string name="pref_auto_updates_summary_always">Download and update apps daily even on mobile data when the device isn\'t being used</string>
++    <string name="pref_auto_updates_summary_only_wifi">Download and update apps periodically on a separate schedule, only on Wi-Fi</string>
++    <string name="pref_auto_updates_summary_always">Download and update apps periodically on a separate schedule, even on mobile data</string>
+     <string name="pref_auto_updates_summary_never">Auto-updates disabled • Apps will need to be updated manually</string>
+     <string name="pref_repo_updates_title">Check for updates</string>
+     <string name="pref_repo_updates_summary_only_wifi">Periodically fetch app updates from repositories only when on Wi-Fi</string>
+     <string name="pref_repo_updates_summary_always">Periodically fetch app updates from repositories even when on mobile data</string>
+     <string name="pref_repo_updates_summary_only_when_open_app">Check for updates only when opened • Apps will become outdated</string>
+     <string name="pref_repo_updates_summary_never">Don\'t check for updates • Apps will become outdated</string>
++    <string name="pref_auto_updates_immediately">Right after each update check</string>
++    <string name="pref_auto_updates_summary_immediately">Download and update apps right after each successful update check</string>
++    <string name="pref_repo_update_interval_title">Check interval</string>
++    <string name="pref_app_update_interval_title">Install interval</string>
++    <string name="pref_app_update_requires_charging_title">Only while charging</string>
++    <string name="pref_app_update_requires_charging_summary">Install updates only while the device is charging</string>
++    <string name="pref_app_update_requires_idle_title">Only when the device is idle</string>
++    <string name="pref_app_update_requires_idle_summary">Install updates only when the device isn\'t being used • Can delay updates a lot</string>
++    <string name="duration_every">Every %s</string>
++    <string name="duration_hours">Hours</string>
++    <string name="duration_minutes">Minutes</string>
++    <string name="duration_error_minimum">The minimum is %d minutes</string>
++    <string name="duration_error_minutes">Minutes must be between 0 and %d</string>
+     <string name="pref_category_network">Network</string>
+     <string name="pref_mirror_chooser_title">Download mirror selection</string>
+     <string name="pref_mirror_chooser_summary_random">Random</string>
+diff --git a/app/src/test/java/org/fdroid/repo/RepoUpdateManagerTest.kt b/app/src/test/java/org/fdroid/repo/RepoUpdateManagerTest.kt
+index def227d..e303b5c 100644
+--- a/app/src/test/java/org/fdroid/repo/RepoUpdateManagerTest.kt
++++ b/app/src/test/java/org/fdroid/repo/RepoUpdateManagerTest.kt
+@@ -3,6 +3,8 @@ package org.fdroid.repo
+ import android.content.Context
+ import app.cash.turbine.test
+ import io.mockk.clearMocks
++import io.mockk.coEvery
++import io.mockk.coVerify
+ import io.mockk.every
+ import io.mockk.just
+ import io.mockk.mockk
+@@ -59,6 +61,7 @@ internal class RepoUpdateManagerTest {
+     every { context.getString(any(), any()) } returns "repo update"
+     every { settingsManager.isFirstStart } returns false
+     every { settingsManager.repoUpdates } returns SettingsConstants.AutoUpdateValues.OnlyWifi
++    every { settingsManager.autoUpdateApps } returns SettingsConstants.AutoUpdateValues.OnlyWifi
+     every { installedAppsCache.installedApps } returns MutableStateFlow(emptyMap())
+   }
+ 
+@@ -298,6 +301,33 @@ internal class RepoUpdateManagerTest {
+       verify(exactly = 1) { notificationManager.showAppUpdatesAvailableNotification(any()) }
+     }
+ 
++  @Test
++  fun `updateRepos installs app updates right away when auto update apps is Immediately`() =
++    runTest {
++      val repo: Repository = mockk(relaxed = true) { every { enabled } returns true }
++
++      every { settingsManager.autoUpdateApps } returns
++        SettingsConstants.AutoUpdateValues.Immediately
++      every { settingsManager.lastRepoUpdate } returns 1337L
++      every { repositoryDao.getRepositories() } returns listOf(repo)
++      every { notificationManager.showUpdateRepoNotification(any(), false, null) } just runs
++      every { repoUpdater.update(repo) } returns IndexUpdateResult.Processed
++      every { notificationManager.cancelUpdateRepoNotification() } just runs
++      every { repositoryDao.walCheckpoint() } just runs
++      every { settingsManager.lastRepoUpdate = any() } just runs
++      every { updatesManager.numUpdates } returns MutableStateFlow(2)
++      coEvery { updatesManager.updateAll(false) } just runs
++
++      clearUpdateManagerMocks()
++
++      repoUpdateManager.updateRepos()
++
++      verify(exactly = 1) { updatesManager.loadUpdates() }
++      coVerify(exactly = 1) { updatesManager.updateAll(false) }
++      verify(exactly = 0) { notificationManager.showAppUpdatesAvailableNotification(any()) }
++      assertFalse(repoUpdateManager.isUpdating.value)
++    }
++
+   @Test
+   fun `updateRepos does not show app update notification when processed repos find no app updates`() =
+     runTest {
+diff --git a/app/src/test/java/org/fdroid/settings/SettingsManagerTest.kt b/app/src/test/java/org/fdroid/settings/SettingsManagerTest.kt
+index 64cfbaa..51ef23a 100644
+--- a/app/src/test/java/org/fdroid/settings/SettingsManagerTest.kt
++++ b/app/src/test/java/org/fdroid/settings/SettingsManagerTest.kt
+@@ -9,15 +9,20 @@ import kotlin.test.assertEquals
+ import kotlin.test.assertFalse
+ import kotlin.test.assertNotEquals
+ import kotlin.test.assertNull
++import kotlin.test.assertTrue
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.test.setMain
+ import org.fdroid.settings.SettingsConstants.AutoUpdateValues
+ import org.fdroid.settings.SettingsConstants.MirrorChooserValues
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_AUTO_UPDATES
++import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_UPDATE_INTERVAL
++import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_UPDATE_REQUIRES_CHARGING
++import org.fdroid.settings.SettingsConstants.PREF_KEY_APP_UPDATE_REQUIRES_IDLE
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_MIRROR_CHOOSER
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_PROXY
+ import org.fdroid.settings.SettingsConstants.PREF_KEY_REPO_AUTO_UPDATES
++import org.fdroid.settings.SettingsConstants.PREF_KEY_REPO_UPDATE_INTERVAL
+ import org.junit.Test
+ 
+ class SettingsManagerTest {
+@@ -103,6 +108,49 @@ class SettingsManagerTest {
+     }
+   }
+ 
++  @Test
++  fun testUpdateScheduleDefaults() {
++    val settingsManager = SettingsManager(context)
++    assertEquals(240, settingsManager.repoUpdateIntervalMinutes)
++    assertEquals(1440, settingsManager.appUpdateIntervalMinutes)
++    assertFalse(settingsManager.appUpdateRequiresCharging)
++    assertFalse(settingsManager.appUpdateRequiresIdle)
++  }
++
++  @Test
++  fun testUpdateScheduleValues() {
++    prefs.edit {
++      putInt(PREF_KEY_REPO_UPDATE_INTERVAL, 90)
++      putInt(PREF_KEY_APP_UPDATE_INTERVAL, 150)
++      putBoolean(PREF_KEY_APP_UPDATE_REQUIRES_CHARGING, true)
++      putBoolean(PREF_KEY_APP_UPDATE_REQUIRES_IDLE, true)
++    }
++    val settingsManager = SettingsManager(context)
++    assertEquals(90, settingsManager.repoUpdateIntervalMinutes)
++    assertEquals(150, settingsManager.appUpdateIntervalMinutes)
++    assertTrue(settingsManager.appUpdateRequiresCharging)
++    assertTrue(settingsManager.appUpdateRequiresIdle)
++  }
++
++  @Test
++  fun testAutoUpdateValueFallbacks() {
++    prefs.edit {
++      putString(PREF_KEY_REPO_AUTO_UPDATES, AutoUpdateValues.Immediately.name)
++      putString(PREF_KEY_APP_AUTO_UPDATES, AutoUpdateValues.OnlyWhenOpenApp.name)
++    }
++    val settingsManager = SettingsManager(context)
++    assertEquals(AutoUpdateValues.OnlyWifi, settingsManager.repoUpdates)
++    assertEquals(AutoUpdateValues.OnlyWifi, settingsManager.autoUpdateApps)
++
++    prefs.edit {
++      putString(PREF_KEY_REPO_AUTO_UPDATES, AutoUpdateValues.OnlyWhenOpenApp.name)
++      putString(PREF_KEY_APP_AUTO_UPDATES, AutoUpdateValues.Immediately.name)
++    }
++    assertEquals(AutoUpdateValues.OnlyWhenOpenApp, settingsManager.repoUpdates)
++    assertEquals(AutoUpdateValues.Immediately, settingsManager.autoUpdateApps)
++    assertFalse(AutoUpdateValues.Immediately.workerEnabled)
++  }
++
+   @Test
+   fun testNoPreferForeignMigration() {
+     SettingsManager(context)
+diff --git a/app/src/test/java/org/fdroid/ui/settings/DurationPreferenceTest.kt b/app/src/test/java/org/fdroid/ui/settings/DurationPreferenceTest.kt
+new file mode 100644
+index 0000000..2d95b95
+--- /dev/null
++++ b/app/src/test/java/org/fdroid/ui/settings/DurationPreferenceTest.kt
+@@ -0,0 +1,48 @@
++package org.fdroid.ui.settings
++
++import kotlin.test.assertEquals
++import kotlin.test.assertNull
++import org.junit.Test
++
++class DurationPreferenceTest {
++
++  @Test
++  fun testFormatDuration() {
++    assertEquals("15 min", formatDuration(15))
++    assertEquals("59 min", formatDuration(59))
++    assertEquals("1 h", formatDuration(60))
++    assertEquals("1 h 05", formatDuration(65))
++    assertEquals("2 h 30", formatDuration(150))
++    assertEquals("4 h", formatDuration(240))
++    assertEquals("24 h", formatDuration(1440))
++    assertEquals("999 h 59", formatDuration(999 * 60 + 59))
++  }
++
++  @Test
++  fun testParseValidDuration() {
++    assertEquals(15, parseDuration("0", "15"))
++    assertEquals(15, parseDuration("", "15"))
++    assertEquals(60, parseDuration("1", ""))
++    assertEquals(60, parseDuration("1", "0"))
++    assertEquals(150, parseDuration("2", "30"))
++    assertEquals(150, parseDuration("02", "30"))
++    assertEquals(999 * 60 + 59, parseDuration("999", "59"))
++  }
++
++  @Test
++  fun testParseInvalidDuration() {
++    // below minimum
++    assertNull(parseDuration("0", "0"))
++    assertNull(parseDuration("", ""))
++    assertNull(parseDuration("0", "14"))
++    assertNull(parseDuration("0", "10"))
++    // out of range
++    assertNull(parseDuration("1", "60"))
++    assertNull(parseDuration("1000", "0"))
++    assertNull(parseDuration("-1", "30"))
++    assertNull(parseDuration("1", "-5"))
++    // not a number
++    assertNull(parseDuration("a", "30"))
++    assertNull(parseDuration("1", "3x"))
++  }
++}
+diff --git a/app/src/test/java/org/fdroid/utils/PeriodicWorkIntervalTest.kt b/app/src/test/java/org/fdroid/utils/PeriodicWorkIntervalTest.kt
+new file mode 100644
+index 0000000..b9b9cd6
+--- /dev/null
++++ b/app/src/test/java/org/fdroid/utils/PeriodicWorkIntervalTest.kt
+@@ -0,0 +1,61 @@
++package org.fdroid.utils
++
++import java.util.concurrent.TimeUnit.MINUTES
++import kotlin.test.assertEquals
++import org.junit.Test
++
++class PeriodicWorkIntervalTest {
++
++  @Test
++  fun testDefaultsAreUnchanged() {
++    // repo updates: 4h with 15 min flex
++    assertEquals(
++      PeriodicWorkInterval(MINUTES.toMillis(240), MINUTES.toMillis(15)),
++      getPeriodicWorkInterval(240, 15),
++    )
++    // app updates: 24h with 60 min flex
++    assertEquals(
++      PeriodicWorkInterval(MINUTES.toMillis(1440), MINUTES.toMillis(60)),
++      getPeriodicWorkInterval(1440, 60),
++    )
++  }
++
++  @Test
++  fun testIntervalIsClampedToMinimum() {
++    for (minutes in listOf(Int.MIN_VALUE, -1, 0, 1, 14, 15)) {
++      assertEquals(
++        PeriodicWorkInterval(MINUTES.toMillis(15), MINUTES.toMillis(15)),
++        getPeriodicWorkInterval(minutes, 15),
++      )
++    }
++  }
++
++  @Test
++  fun testFlexIsNotLongerThanInterval() {
++    assertEquals(
++      PeriodicWorkInterval(MINUTES.toMillis(30), MINUTES.toMillis(30)),
++      getPeriodicWorkInterval(30, 60),
++    )
++    assertEquals(
++      PeriodicWorkInterval(MINUTES.toMillis(15), MINUTES.toMillis(15)),
++      getPeriodicWorkInterval(10, 60),
++    )
++  }
++
++  @Test
++  fun testFlexIsNotShorterThanMinimum() {
++    assertEquals(
++      PeriodicWorkInterval(MINUTES.toMillis(60), MINUTES.toMillis(5)),
++      getPeriodicWorkInterval(60, 0),
++    )
++  }
++
++  @Test
++  fun testLargeInterval() {
++    val minutes = 999 * 60 + 59
++    assertEquals(
++      PeriodicWorkInterval(MINUTES.toMillis(minutes.toLong()), MINUTES.toMillis(60)),
++      getPeriodicWorkInterval(minutes, 60),
++    )
++  }
++}

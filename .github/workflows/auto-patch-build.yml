@@ -1,0 +1,212 @@
+name: Auto-Patch & Build F-Droid (minuteries MAJ)
+
+on:
+  schedule:
+    # 10h01 à Paris toute l'année : 08:01 UTC en heure d'été, 09:01 UTC en heure d'hiver.
+    # Le job « check » ne garde que le cron correspondant au décalage horaire du jour.
+    - cron: '1 8 * * *'
+    - cron: '1 9 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Tag officiel à construire (vide = dernière version stable)"
+        required: false
+        default: ''
+        type: string
+      bump_type:
+        description: "Incrément du patch (auto = +0.1.0 si nouvelle version officielle, +0.0.1 sinon)"
+        required: false
+        default: 'auto'
+        type: choice
+        options: [auto, minor, patch, none]
+      force_build:
+        description: "Reconstruire même si la version officielle est déjà construite"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fdroid-timer-patch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  APP_NAME: "F-Droid"
+  APK_PREFIX: "fdroid"
+  UPSTREAM_KIND: "git-tags"
+  UPSTREAM_REPO: ""
+  UPSTREAM_GIT: "https://gitlab.com/fdroid/fdroidclient.git"
+  UPSTREAM_WEB: "https://gitlab.com/fdroid/fdroidclient/-/tags"
+  GRADLE_TEST_TASKS: ":app:testFullDefaultDebugUnitTest"
+  GRADLE_ASSEMBLE_TASK: ":app:assembleFullDefaultRelease"
+  APK_OUTPUT_DIR: "app/build/outputs/apk/fullDefault/release"
+  EXPECTED_CERT_SHA256: "6a06af7388b2dfae619c129b72dde7f005a6b8794384eed716d124a952dfe15a"
+
+jobs:
+  check:
+    name: Vérifier la dernière version officielle
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.plan.outputs.should_build }}
+      upstream_tag: ${{ steps.plan.outputs.upstream_tag }}
+      patch_version: ${{ steps.plan.outputs.patch_version }}
+      build_index: ${{ steps.plan.outputs.build_index }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      release_title: ${{ steps.plan.outputs.release_title }}
+      apk_name: ${{ steps.plan.outputs.apk_name }}
+    steps:
+      - name: Filtre horaire (10h heure de Paris)
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ "$EVENT" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          case "$(TZ=Europe/Paris date +%z)" in
+            +0200) WANT='1 8 * * *' ;;
+            *)     WANT='1 9 * * *' ;;
+          esac
+          if [ "$SCHEDULE" = "$WANT" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Cron « $SCHEDULE » ignoré (aujourd'hui 10h Paris = « $WANT »)."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Garder le workflow planifié actif (GitHub le désactive après 60 j sans activité)
+        if: steps.gate.outputs.run == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/auto-patch-build.yml/enable"
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Décider s'il faut construire
+        id: plan
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          INPUT_BUMP_TYPE: ${{ inputs.bump_type || 'auto' }}
+          INPUT_FORCE_BUILD: ${{ inputs.force_build || 'false' }}
+        run: python3 scripts/plan.py
+
+  build-and-release:
+    name: Patch, tests, build & release (${{ needs.check.outputs.release_title }})
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cloner le code officiel (${{ needs.check.outputs.upstream_tag }})
+        run: |
+          git clone --depth 1 --branch "${{ needs.check.outputs.upstream_tag }}" "$UPSTREAM_GIT" upstream
+
+      - name: Appliquer le patch
+        run: bash scripts/apply_patch.sh upstream
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Accepter les licences Android SDK
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -name sdkmanager \( -type f -o -type l \) 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          fi
+
+      - name: Calculer versionCode / versionName
+        id: ver
+        working-directory: upstream
+        run: |
+          CODE="$(grep -m1 -Eo 'versionCode\s*=\s*[0-9]+' app/build.gradle.kts | grep -Eo '[0-9]+')"
+          NAME="$(grep -m1 -Eo 'versionName\s*=\s*"[^"]+"' app/build.gradle.kts | sed -E 's/.*"([^"]+)"/\1/')"
+          [ -n "$CODE" ] && [ -n "$NAME" ] || { echo "versionCode/versionName introuvables" >&2; exit 1; }
+          PATCH_CODE=$(( CODE * 100 + ${{ needs.check.outputs.build_index }} ))
+          PATCH_NAME="${NAME}-patch-v${{ needs.check.outputs.patch_version }}"
+          echo "Amont : $NAME ($CODE) -> patché : $PATCH_NAME ($PATCH_CODE)"
+          echo "code=$PATCH_CODE" >> "$GITHUB_OUTPUT"
+          echo "name=$PATCH_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Tests unitaires
+        working-directory: upstream
+        run: ./gradlew --no-daemon $GRADLE_TEST_TASKS
+
+      - name: Compiler l'APK release
+        working-directory: upstream
+        run: |
+          ./gradlew --no-daemon "$GRADLE_ASSEMBLE_TASK" \
+            -PpatchVersionCode="${{ steps.ver.outputs.code }}" \
+            -PpatchVersionName="${{ steps.ver.outputs.name }}"
+
+      - name: Signer l'APK
+        env:
+          KEY_JKS: ${{ secrets.KEY_JKS }}
+          ALIAS: ${{ secrets.ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          UNSIGNED="$(find "upstream/$APK_OUTPUT_DIR" -name '*-unsigned.apk' | head -n 1)"
+          [ -f "$UNSIGNED" ] || { echo "APK non signé introuvable dans upstream/$APK_OUTPUT_DIR" >&2; exit 1; }
+          mkdir -p dist
+          bash scripts/sign_apk.sh "$UNSIGNED" "dist/${{ needs.check.outputs.apk_name }}"
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -n 1)"
+          "$BT/aapt2" dump badging "dist/${{ needs.check.outputs.apk_name }}" | head -n 1
+          (cd dist && sha256sum "${{ needs.check.outputs.apk_name }}" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Publier la release GitHub et mettre à jour state.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+          PATCH_VERSION: ${{ needs.check.outputs.patch_version }}
+          BUILD_INDEX: ${{ needs.check.outputs.build_index }}
+          RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+          RELEASE_TITLE: ${{ needs.check.outputs.release_title }}
+          APK_NAME: ${{ needs.check.outputs.apk_name }}
+          VERSION_CODE: ${{ steps.ver.outputs.code }}
+          VERSION_NAME: ${{ steps.ver.outputs.name }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          state = {
+              "last_upstream_tag": os.environ["UPSTREAM_TAG"],
+              "patch_version": os.environ["PATCH_VERSION"],
+              "build_index": int(os.environ["BUILD_INDEX"]),
+          }
+          with open("state.json", "w", encoding="utf-8") as f:
+              json.dump(state, f, indent=2)
+              f.write("\n")
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "chore: $RELEASE_TITLE" || echo "state.json inchangé"
+          git push
+
+          cat > notes.md <<EOF
+          **$APP_NAME $UPSTREAM_TAG** officiel + patch **v$PATCH_VERSION** (minuteries séparées recherche / installation auto).
+
+          - Version officielle : $UPSTREAM_WEB/$UPSTREAM_TAG
+          - versionName : \`$VERSION_NAME\` — versionCode : \`$VERSION_CODE\`
+          - Certificat de signature (SHA-256) : \`$EXPECTED_CERT_SHA256\`
+          EOF
+          gh release create "$RELEASE_TAG" \
+            "dist/$APK_NAME" dist/SHA256SUMS.txt \
+            --title "$RELEASE_TITLE" \
+            --notes-file notes.md \
+            --target "$(git rev-parse HEAD)" \
+            --latest
