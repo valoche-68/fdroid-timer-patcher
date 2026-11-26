@@ -37,13 +37,13 @@ ALIGNED="$KS_DIR/aligned.apk"
   --out "$OUT" \
   "$ALIGNED"
 
-CERTS="$("$BT/apksigner" verify --verbose --print-certs "$OUT")"
-echo "$CERTS" | grep -E "Verified using|Signer #1 certificate (DN|SHA-256)"
+CERTS="$("$BT/apksigner" verify --verbose --print-certs "$OUT" 2>&1)"
+echo "$CERTS"
 if [ -n "${EXPECTED_CERT_SHA256:-}" ]; then
-  GOT="$(echo "$CERTS" | grep -m1 'Signer #1 certificate SHA-256 digest' | awk '{print $NF}')"
+  GOT="$(echo "$CERTS" | grep -i -E 'SHA-?256' | grep -Eo '[0-9a-fA-F]{64}|([0-9a-fA-F]{2}:){31}[0-9a-fA-F]{2}' | tr -d ':' | tr '[:upper:]' '[:lower:]' | head -n 1 || true)"
   if [ "$GOT" != "$EXPECTED_CERT_SHA256" ]; then
-    echo "ERREUR : certificat inattendu ($GOT != $EXPECTED_CERT_SHA256)" >&2
+    echo "ERREUR : certificat inattendu ('$GOT' != '$EXPECTED_CERT_SHA256')" >&2
     exit 1
   fi
-  echo "Certificat de signature conforme."
+  echo "Certificat de signature conforme ($GOT)."
 fi
